@@ -40,18 +40,30 @@ The signature is what prevents tampering. If someone changes the payload, the si
 
 ```xml
 <!-- io.jsonwebtoken (JJWT) — the most popular Java JWT library -->
+
+<!-- jjwt-api: the public API — contains the interfaces and classes you write code against
+     (e.g. Jwts.builder(), Claims, JwtParser). Compile-time dependency. -->
 <dependency>
     <groupId>io.jsonwebtoken</groupId>
     <artifactId>jjwt-api</artifactId>
     <version>0.12.3</version>
 </dependency>
+
+<!-- jjwt-impl: the actual implementation of the API — does the real work of signing,
+     parsing, and validating tokens. You never call it directly; the API delegates to it
+     via Java's ServiceLoader at runtime. Runtime-only so your code stays decoupled
+     from the internals. -->
 <dependency>
     <groupId>io.jsonwebtoken</groupId>
     <artifactId>jjwt-impl</artifactId>
     <version>0.12.3</version>
     <scope>runtime</scope>
-    <!-- runtime scope — only needed at runtime, not compile time -->
 </dependency>
+
+<!-- jjwt-jackson: plugs Jackson (the JSON library Spring Boot already includes) into JJWT
+     so it can serialize/deserialize the JWT payload (claims) to/from JSON.
+     Without this, JJWT cannot read or write the body of the token. Runtime-only
+     because it is wired up automatically, not called directly in your code. -->
 <dependency>
     <groupId>io.jsonwebtoken</groupId>
     <artifactId>jjwt-jackson</artifactId>
@@ -227,7 +239,10 @@ public class JwtTokenProvider {
 ## Step 3: JWT Authentication Filter
 
 ```java
-@Component
+// No @Component here — intentional. See SecurityConfig for why.
+// Short reason: @Component would cause Spring Boot to register this filter in
+// BOTH Tomcat's servlet filter chain AND Spring Security's internal FilterChainProxy,
+// resulting in the filter executing twice per request.
 public class JwtAuthenticationFilter extends OncePerRequestFilter {
     // OncePerRequestFilter — runs exactly once per request, even on forwards/includes
 
@@ -392,16 +407,41 @@ public class AuthController {
 @EnableWebSecurity
 public class SecurityConfig {
 
-    private final JwtAuthenticationFilter jwtAuthFilter;
+    // JwtTokenProvider is @Component — safe to inject here. It has no filter chain side effects.
+    // We do NOT inject JwtAuthenticationFilter — we declare it as a @Bean below instead.
+    private final JwtTokenProvider jwtTokenProvider;
     private final AppUserDetailsService userDetailsService;
     private final PasswordEncoder passwordEncoder;
 
-    public SecurityConfig(JwtAuthenticationFilter jwtAuthFilter,
+    public SecurityConfig(JwtTokenProvider jwtTokenProvider,
                           AppUserDetailsService userDetailsService,
                           PasswordEncoder passwordEncoder) {
-        this.jwtAuthFilter = jwtAuthFilter;
+        this.jwtTokenProvider = jwtTokenProvider;
         this.userDetailsService = userDetailsService;
         this.passwordEncoder = passwordEncoder;
+    }
+
+    // WHY @Bean here and NOT @Component on the filter class:
+    //
+    // Spring Boot auto-configuration scans all @Component beans that implement
+    // javax.servlet.Filter and registers each one in Tomcat's servlet filter chain
+    // via FilterRegistrationBean — automatically, without you asking.
+    //
+    // Spring Security's FilterChainProxy (the thing that runs YOUR security rules)
+    // lives inside Tomcat's chain as a single DelegatingFilterProxy entry.
+    // If JwtAuthenticationFilter is also registered directly in Tomcat's chain,
+    // it runs BEFORE DelegatingFilterProxy — outside Spring Security's managed scope.
+    // That means Spring Security's SecurityContextHolderFilter (which governs the
+    // SecurityContext lifecycle) can wipe the authentication you just set.
+    //
+    // Declaring the filter as a @Bean here means Spring Boot never sees it as a
+    // candidate for auto-registration. The ONLY place it enters a filter chain
+    // is via the explicit addFilterBefore() call below — inside FilterChainProxy,
+    // where exception handling, SecurityContext management, and audit logging
+    // all work correctly.
+    @Bean
+    public JwtAuthenticationFilter jwtAuthenticationFilter() {
+        return new JwtAuthenticationFilter(jwtTokenProvider, userDetailsService);
     }
 
     @Bean
@@ -430,10 +470,12 @@ public class SecurityConfig {
             .authenticationProvider(authenticationProvider())
             // Register the DaoAuthenticationProvider that uses our UserDetailsService
 
-            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
-            // addFilterBefore — JWT filter runs BEFORE the form login filter
-            // By the time UsernamePasswordAuthenticationFilter runs,
-            // auth is already set in SecurityContext (JWT already validated)
+            .addFilterBefore(jwtAuthenticationFilter(), UsernamePasswordAuthenticationFilter.class)
+            // addFilterBefore — places JwtAuthenticationFilter INSIDE FilterChainProxy,
+            // just before the form login filter. This is the ONLY place the filter
+            // is wired in — Tomcat's servlet chain never sees it directly.
+            // Spring intercepts the jwtAuthenticationFilter() call and returns the
+            // singleton bean (not a new instance each time).
 
             .exceptionHandling(ex -> ex
                 .authenticationEntryPoint((request, response, exception) -> {

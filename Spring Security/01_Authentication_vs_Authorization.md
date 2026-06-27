@@ -197,6 +197,59 @@ public class UserService {
 }
 ```
 
+#### How `@PreAuthorize` is Actually Executed — Spring AOP, not HandlerInterceptor
+
+`@PreAuthorize` is run by **Spring AOP** — not by `FilterSecurityInterceptor`, not by any `HandlerInterceptor`.
+
+When you add `@EnableMethodSecurity` to your config, Spring wraps every bean that has security annotations in a **proxy object** at startup. When another bean calls a method on it, the call goes through the proxy first:
+
+```
+Without @EnableMethodSecurity:
+  Controller → calls → OrderService (real object)
+
+With @EnableMethodSecurity:
+  Controller → calls → OrderService CGLIB Proxy
+                              ↓
+                  AuthorizationManagerBeforeMethodInterceptor
+                  evaluates: hasRole('ADMIN') against SecurityContextHolder
+                              ↓  PASS
+                  real OrderService.deleteUser() runs
+                              ↓  FAIL
+                  throws AccessDeniedException → 403
+```
+
+The full call chain when `@PreAuthorize` is involved:
+
+```
+[Spring Security Filter Chain]  ← AuthorizationFilter checks URL rules
+          ↓
+[DispatcherServlet]
+          ↓
+[HandlerInterceptor.preHandle()]  ← Spring MVC layer (unrelated to security annotations)
+          ↓
+[@RestController method runs]
+          ↓  calls orderService.deleteUser(id)
+[CGLIB Proxy around OrderService]  ← AOP intercepts HERE
+          ↓
+[AuthorizationManagerBeforeMethodInterceptor]
+          ↓  evaluates @PreAuthorize SpEL expression
+[real OrderService.deleteUser() runs — or AccessDeniedException thrown]
+```
+
+**Why AOP and not `HandlerInterceptor`?**
+
+`HandlerInterceptor` is a Spring MVC concept — it only knows about HTTP requests and runs once per HTTP request before/after a controller method. It cannot intercept calls between service beans.
+
+`@PreAuthorize` needs to work on **any Spring bean**: a `@Service` called from a controller, a `@Service` called from a scheduled job, a `@Repository` called from a service. There is no HTTP request involved in half of these cases. AOP proxies operate at the Java method call level, independent of HTTP — which is exactly the right tool.
+
+**Proof you can see yourself:** Inject an `OrderService` that has `@PreAuthorize` on its methods, then print `orderService.getClass()`. Instead of `class com.example.OrderService` you will see:
+
+```
+class com.example.OrderService$$SpringCGLIB$$0
+```
+
+The `$$SpringCGLIB$$0` suffix is the proxy Spring generated. Every method call routes through it first.
+
 ---
 
 ## Roles vs Authorities — The Confusion Explained
@@ -228,16 +281,19 @@ PRODUCT_DELETE      <-- this is a GrantedAuthority (string)
 
 ---
 
-## The AccessDecisionManager (How Authorization is Decided)
+## The AccessDecisionManager (How URL Authorization is Decided)
 
-When a request hits a secured resource, Spring Security uses an `AccessDecisionManager`:
+`FilterSecurityInterceptor` (older Spring Security) and its modern replacement `AuthorizationFilter` handle **URL-level authorization only** — the rules you write inside `authorizeHttpRequests(...)`. Method-level authorization (`@PreAuthorize`, `@PostAuthorize`) is handled by a completely separate AOP mechanism described above.
+
+When a request hits a secured URL, Spring Security uses an `AccessDecisionManager`:
 
 ```
-Request arrives at secured endpoint
+Request arrives at secured URL
             |
             v
-    FilterSecurityInterceptor
-    // Intercepts the request at the last filter in the chain
+    AuthorizationFilter  (= FilterSecurityInterceptor in older versions)
+    // Last filter in the Spring Security chain — runs BEFORE DispatcherServlet
+    // Only responsible for URL-level rules, NOT @PreAuthorize on methods
             |
             v
     Collects ConfigAttributes (the required permissions for this URL)
@@ -320,6 +376,40 @@ public class OrderController {
     }
 }
 ```
+
+---
+
+## Authorization Layers — Where Each One Runs
+
+Three different mechanisms enforce authorization in a Spring Boot app. They sit at different layers and serve different purposes:
+
+```
+HTTP Request
+     ↓
+[Servlet Filter Chain]
+     ↓
+[AuthorizationFilter]  ← URL-level: checks authorizeHttpRequests() rules
+     ↓  (if URL access is granted)
+[DispatcherServlet]
+     ↓
+[HandlerInterceptor.preHandle()]  ← Spring MVC layer
+                                     NOT a security mechanism by default
+                                     Used for: logging, rate limiting, locale setup
+     ↓
+[@Controller method]
+     ↓  calls a @Service method
+[CGLIB Proxy — AOP intercepts]  ← Method-level: evaluates @PreAuthorize / @PostAuthorize
+     ↓  (if method access is granted)
+[real @Service method runs]
+```
+
+| Layer | Mechanism | Configured via | Scope |
+|---|---|---|---|
+| Servlet filter | `AuthorizationFilter` | `authorizeHttpRequests(...)` | URL patterns |
+| Spring MVC | `HandlerInterceptor` | `WebMvcConfigurer.addInterceptors()` | HTTP requests (not security) |
+| Spring AOP | `AuthorizationManagerBeforeMethodInterceptor` | `@PreAuthorize` / `@PostAuthorize` | Individual method calls |
+
+**Key rule:** URL-level and method-level checks are independent and can be combined. A request can pass the URL check but still be blocked at the method level — for example, all authenticated users can reach `GET /api/documents/{id}`, but `@PostAuthorize` on the service method ensures you only get back documents you own.
 
 ---
 
